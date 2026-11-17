@@ -1,0 +1,257 @@
+# QWEN.md — Техническое задание для AI-агента
+
+## 1. Контекст проекта
+
+Курсовой проект по дисциплине «Системы поддержки принятия решений».
+Тема: **Интеллектуальная СППР для управления персональными образовательными траекториями**.
+
+Суть системы: ML-модель прогнозирует риск того, что студент не завершит курс
+(отчисление/неуспешность), а слой экспертных правил формирует корректирующую
+траекторию (упорядоченный список действий). ЛПР — куратор/методист онлайн-программы.
+Тип СППР: гибрид data-driven (классификатор) + knowledge-driven (правила).
+Интерфейс: Streamlit, язык UI — русский.
+
+Данные: OULAD (Open University Learning Analytics Dataset), 7 CSV в `data/raw/`.
+Скачивание уже реализовано в `src/download_data.py` — НЕ трогать этот файл.
+
+Архитектура по слоям (для README и отчёта):
+- Data collection → `src/download_data.py`
+- Data Mining → `src/data_prep.py`, `src/train.py`
+- Моделирование → `src/predict.py`, `src/rules.py`
+- Интерфейс → `app.py`
+- Хранение решений → `src/db.py` (SQLite)
+
+## 2. Жёсткие ограничения (нарушать нельзя)
+
+1. **Зависимости только из requirements.txt**: pandas, numpy, scikit-learn,
+   streamlit, matplotlib, requests (+ joblib как зависимость sklearn).
+   ЗАПРЕЩЕНО добавлять: torch, tensorflow, shap, xgboost, lightgbm, catboost,
+   pyarrow, pytest и любые другие. Всё нужное есть в sklearn/pandas.
+2. **Не скачивать датасет и не запускать тяжёлые скрипты.** Реальных данных
+   в среде агента может не быть. Проверка кода — через синтаксис и тесты
+   на синтетических фикстурах (раздел 9).
+3. **Не менять** `src/download_data.py`, `requirements.txt`, `.gitignore`
+   (кроме добавления строки `models/*.joblib`).
+4. Windows-совместимость: pathlib, `encoding="utf-8"` при чтении/записи текстов,
+   команды в README — для PowerShell. Никаких bash-скриптов.
+5. Все docstrings, комментарии, UI-тексты — на русском (пойдут в отчёт).
+   Идентификаторы кода — на английском.
+6. Простота важнее изящества. Если контракт неоднозначен — выбери простейший
+   вариант и запиши решение в `docs/DECISIONS.md`. Не останавливайся ради вопросов.
+7. Никакой генерации текста/LLM. Объяснения прогноза — только feature importance
+   и вклады признаков.
+
+## 3. Структура репозитория
+
+Уже есть: `src/download_data.py`, `requirements.txt`, `.gitignore`, папки
+`data/`, `models/`, `db/`, `src/`.
+
+Создать:
+```
+src/data_prep.py      # подготовка витрины
+src/train.py          # обучение и выбор модели
+src/predict.py        # загрузка модели, прогноз, объяснение
+src/rules.py          # экспертный слой → траектория
+src/db.py             # SQLite: студенты, прогнозы, журнал решений
+src/evaluate.py       # чек-лист оценки СППР
+app.py                # Streamlit-интерфейс
+tests/make_fixtures.py
+tests/test_pipeline.py
+README.md
+docs/DECISIONS.md
+```
+
+## 4. Контракт данных OULAD (реальные схемы, не выдумывать колонки)
+
+| Файл | Колонки |
+|---|---|
+| courses.csv | code_module, code_presentation, module_presentation_length |
+| assessments.csv | code_module, code_presentation, id_assessment, assessment_type, date, weight |
+| vle.csv | id_site, code_module, code_presentation, activity_type, week |
+| studentInfo.csv | code_module, code_presentation, id_student, gender, region, highest_education, imd_band, age_band, num_of_prev_attempts, studied_credits, disability, final_result |
+| studentRegistration.csv | code_module, code_presentation, id_student, date_registration, date_unregistration |
+| studentAssessment.csv | id_assessment, id_student, date_submitted, is_banked, score |
+| studentVle.csv | code_module, code_presentation, id_student, id_site, date, sum_click |
+
+Справочные значения:
+- final_result: Distinction (3024), Pass (12361), Fail (7052), Withdrawn (10156).
+- assessment_type: TMA, CMA, Exam. У Exam поле date = NaN.
+- imd_band: строки вида "0-10%"..."90-100%", есть пропуски (~1111).
+- age_band: "0-35", "35-55", "55<=". disability: Y/N.
+- score: 0–100, бывают NaN. date в VLE может быть отрицательным (доступ до старта).
+- Ключ студента: (id_student, code_module, code_presentation).
+- Эталонные счётчики строк — в EXPECTED_ROWS в download_data.py.
+
+## 5. Спецификация модулей
+
+### 5.1 src/data_prep.py
+CLI: `--raw-dir` (default data/raw), `--out` (default data/processed/mart.csv),
+`--cutoff` (default 60), `--with-vle` (flag, задача P1).
+
+Логика:
+1. Целевая переменная: `risk = 1` если final_result ∈ {Fail, Withdrawn}, иначе 0.
+2. **Раннее прогнозирование**: используем только данные с date <= cutoff.
+3. Исключить студентов с date_unregistration <= cutoff (исход уже наступил).
+   Поле date_unregistration в фичи НЕ включать (утечка).
+4. Фичи из studentInfo: gender, region, highest_education, imd_band, age_band,
+   disability (категориальные); num_of_prev_attempts, studied_credits (числовые).
+   Пропуски не заполнять здесь — импутация внутри sklearn-пайплайна.
+5. date_registration из studentRegistration (числовая, NaN допустим).
+6. Фичи из studentAssessment ⋈ assessments (только date <= cutoff), префикс ass_:
+   ass_mean_score, ass_min_score, ass_max_score, ass_weighted_mean (веса weight,
+   нормировать), ass_n_submitted, ass_n_expected (число заданий с date <= cutoff),
+   ass_n_missing = expected − submitted, ass_mean_delay (date_submitted − date),
+   ass_n_banked. Студентам без сданных заданий — NaN в score-фичах, 0 в счётчиках.
+7. Слабые места для правил: JSON-колонка `weak_topics` — список
+   {id_assessment, assessment_type, score} где score < 40.
+8. P1 (--with-vle): агрегация studentVle чанками (chunksize=1_000_000,
+   usecols только нужные), date <= cutoff: vle_total_clicks, vle_active_days,
+   vle_mean_daily_clicks, vle_clicks_last14d.
+9. Выход: mart.csv (utf-8). Колонки: ключи, фичи, weak_topics, final_result
+   (справочно), risk. Печать: форма витрины, доля risk=1, пропуски по колонкам.
+
+**Запрет утечек**: никаких фич из final_result, date_unregistration,
+данных после cutoff.
+
+### 5.2 src/train.py
+CLI: `--mart`, `--models-dir` (default models/).
+1. X = витрина минус [ключи, final_result, risk, weak_topics]. y = risk.
+2. train_test_split: test_size=0.2, stratify=y, random_state=42.
+3. Preprocessor (ColumnTransformer): числовые → SimpleImputer(median) +
+   StandardScaler; категориальные → SimpleImputer(constant="missing") +
+   OneHotEncoder(handle_unknown="ignore").
+4. Две модели-кандидата (Pipeline = preprocessor + модель):
+   - LogisticRegression(max_iter=1000, class_weight="balanced")
+   - HistGradientBoostingClassifier(random_state=42)
+5. Выбор по ROC-AUC на тесте; **если LR отстаёт не более чем на 0.02 — выбрать LR**
+   (интерпретируемость важна для СППР, зафиксировать в DECISIONS.md).
+6. Артефакты в models/: model.joblib (весь pipeline), metrics.json
+   {model_name, roc_auc, f1, precision, recall, accuracy, confusion_matrix,
+   cutoff_day, n_train, n_test, feature_names}, feature_importance.csv,
+   roc_curve.png, confusion_matrix.png, feature_importance.png (топ-15).
+
+### 5.3 src/predict.py
+Функции (используются app.py и evaluate.py):
+- `load_model(path="models/model.joblib")`
+- `predict_risk(features: dict) -> float` — один студент, dict фич → вероятность.
+- `explain_student(features: dict, top_n=5) -> list[dict]` — для LR:
+  вклад = coef_j * x_j (после препроцессора), вернуть
+  {feature, value, contribution, direction: "повышает/понижает риск"},
+  сортировка по |contribution|. Для HGB: глобальная importance + отклонение
+  значения от медианы обучающей выборки (эвристика, задокументировать).
+- `what_if(features: dict, overrides: dict) -> float` — сценарный пересчёт.
+  В docstring注明: это сценарный анализ, не причинно-следственная модель.
+
+### 5.4 src/rules.py
+Декларативная таблица RULES + функция:
+`build_trajectory(risk: float, features: dict, weak_topics: list) -> list[dict]`
+Каждая рекомендация: {rule_id, priority, action, reason}. Детерминированный
+порядок (priority, rule_id). Зоны риска: >=0.7 красная, 0.35–0.7 жёлтая,
+<0.35 зелёная.
+
+Минимальный набор правил (расширить до 8–10, формулировки на русском):
+| ID | Условие | Действие |
+|---|---|---|
+| R1 | risk >= 0.7 | Срочная консультация куратора (в течение 3 дней) |
+| R2 | ass_n_missing >= 2 | План сдачи пропущенных заданий |
+| R3 | weak_topics не пуст | Повторить темы по слабым заданиям (перечислить) |
+| R4 | ass_mean_delay > 7 | Еженедельные чек-ины, план вовлечения |
+| R5 | num_of_prev_attempts >= 2 | Снизить нагрузку: не более одного курса параллельно |
+| R6 | disability == "Y" | Адаптивные материалы, увеличенное время на задания |
+| R7 | 0.35 <= risk < 0.7 | Дополнительные практики по слабым темам |
+| R8 | risk < 0.35 | Штатная траектория, контрольная точка через 2 недели |
+Каждое правило снабдить reason (почему сработало, со ссылкой на значения фич).
+
+### 5.5 src/db.py
+SQLite: `db/dss.sqlite`. Функции: init_db(), import_mart(mart_path)
+(идемпотентно, INSERT OR REPLACE), get_students(filters), get_student(key),
+save_prediction(...), save_decision(...), get_decisions(student_key).
+
+Схема:
+```sql
+students(id_student INT, code_module TEXT, code_presentation TEXT,
+  gender TEXT, region TEXT, highest_education TEXT, imd_band TEXT,
+  age_band TEXT, disability TEXT, num_of_prev_attempts INT,
+  studied_credits INT, features_json TEXT, weak_topics_json TEXT,
+  PRIMARY KEY(id_student, code_module, code_presentation));
+predictions(id INTEGER PRIMARY KEY AUTOINCREMENT, id_student INT,
+  code_module TEXT, code_presentation TEXT, risk REAL, risk_band TEXT,
+  model_name TEXT, created_at TEXT);
+decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, prediction_id INT REFERENCES predictions(id),
+  trajectory_json TEXT, curator_action TEXT CHECK(curator_action IN ('approved','modified','rejected')),
+  comment TEXT, created_at TEXT);
+```
+
+### 5.6 app.py (Streamlit, русский UI)
+- Заголовок «СППР управления образовательными траекториями», layout="wide".
+- Sidebar: фильтры code_module, code_presentation, зона риска; авто-инициализация
+  БД и импорт витрины при первом запуске.
+- Список студентов с risk (подсветка зон), выбор студента → карточка:
+  st.metric с риском и зоной; топ-5 факторов (горизонтальный bar chart);
+  траектория (таблица: приоритет, действие, обоснование).
+- Блок «What-if анализ»: слайдеры — ожидаемый средний балл (0–100, меняет
+  ass_mean_score и ass_weighted_mean), studied_credits (30–240),
+  множитель активности (P1, меняет vle_*). Кнопка «Пересчитать» →
+  новый риск, дельта к базовому, обновлённая траектория.
+- Форма решения: approved/modified/rejected + комментарий → save_prediction +
+  save_decision. Раскрывающийся «Журнал решений» по студенту.
+- Кэш: @st.cache_resource для модели, @st.cache_data для витрины.
+- Если нет модели/данных — понятное сообщение с командами запуска, без traceback.
+
+### 5.7 src/evaluate.py
+Чек-лист оценки СППР (для раздела 6 отчёта), выход: models/evaluation.md
+(таблица: критерий, метод проверки, результат, статус) + evaluation.json.
+Проверки:
+1. Качество: ROC-AUC >= 0.75, F1 >= 0.70 (пороги — критерии приёмки).
+2. Плохие данные: искусственно внести NaN в 20% imd_band и score-фич →
+   пайплайн не падает, деградация AUC < 0.05.
+3. Ресурсы: средний predict_risk < 100 мс (100 прогонов), модель < 10 МБ, CPU.
+4. Детерминизм: два identical-вызова дают identical-результат.
+5. What-if sanity: рост среднего балла не увеличивает риск (монотонность).
+6. Границы: score=0 и 100, пустые weak_topics, отсутствующие фичи — без падений.
+
+## 6. Тесты без реальных данных (обязательно до сдачи P0)
+
+- `tests/make_fixtures.py`: генерирует 7 CSV с ТОЧНЫМИ схемами из раздела 4
+  в tests/fixtures/raw/ (30 студентов, 2 модуля × 2 презентации, ~60 оценок,
+  ~500 строк VLE,random_state=42, есть пропуски и обе зоны риска).
+- `tests/test_pipeline.py`: plain asserts, без pytest. Прогоняет
+  data_prep → train → predict → rules → db → evaluate на фикстурах
+  (через CLI-аргументы путей), проверяет: витрина непуста, нет утечек
+  (в фичах нет final_result/date_unregistration), метрики считаются,
+  траектория детерминирована, БД создаётся, what-if работает.
+  Печать «ALL TESTS PASSED» в конце.
+
+## 7. Приоритеты задач
+
+- **P0 (сделать полностью, по порядку)**: data_prep (без VLE) → train →
+  predict → rules → db → app → evaluate → fixtures + test_pipeline → README.
+- **P1**: VLE-фичи (--with-vle, чанками), слайдер активности в what-if,
+  docs/report_notes.md (факты для отчёта: счётчики, метрики, решения).
+- **P2**: только по явному запросу владельца. Не делать по своей инициативе.
+
+## 8. Критерии готовности (Definition of Done)
+
+В PowerShell из корня репо:
+```
+python tests/make_fixtures.py
+python tests/test_pipeline.py        # ALL TESTS PASSED
+```
+На реальных данных (проверяет владелец, не агент):
+```
+python src/download_data.py
+python src/data_prep.py
+python src/train.py
+python src/evaluate.py
+streamlit run app.py
+```
+README.md содержит эти команды, описание архитектуры по слоям и назначение
+каждого модуля.
+
+## 9. Стиль и git
+
+- Python 3.11+, type hints, docstrings на русском, функции короткие.
+- Коммит после каждой завершённой задачи: "P0: data_prep — сборка витрины",
+  "P0: train — обучение и выбор модели" и т.д.
+- Не коммитить: data/, *.joblib, __pycache__, .venv.
+- Артефакты metrics.json и PNG можно коммитить (маленькие, нужны для отчёта).
